@@ -1,0 +1,241 @@
+#include <Wire.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BMP280.h>
+#include "DHT.h"
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <NimBLEDevice.h>
+
+NimBLEServer* pServer;
+NimBLECharacteristic* pCharacteristic;
+
+#define SERVICE_UUID "12345678-1234-1234-1234-1234567890ab"
+#define CHARACTERISTIC_UUID "87654321-4321-4321-4321-ba0987654321"
+#define LED_PIN 10
+
+// --- WiFi ---
+//const char* ssid = "UPC2719045";
+//const char* password = "arf5cwt8zVen";
+const char* ssid = "EjMickey";
+const char* password = "azal7898";
+
+// --- HTTP / serwer ---
+String serverName = "https://embedded-server-m7j9.onrender.com";
+unsigned long lastTime = 0;
+unsigned long timerDelay = 5000;
+
+#define I2C_SDA 8
+#define I2C_SCL 9
+#define DHTPIN 4
+#define DHTTYPE DHT11
+#define SOIL_PIN 0
+
+// --- Kalibracja gleby ---
+#define DRY_VALUE 3000  // sucho
+#define WET_VALUE 1000  // mokro
+
+// --- Obiekty czujników ---
+Adafruit_BMP280 bmp;
+DHT dht(DHTPIN, DHTTYPE);
+
+class MyCallbacks : public NimBLECharacteristicCallbacks {
+  void onWrite(NimBLECharacteristic* pCharacteristic, NimBLEConnInfo& connInfo) {
+    std::string value = pCharacteristic->getValue();
+    Serial.print("Odebrano przez BLE: ");
+    Serial.println(value.c_str());
+    if (value == "ON") {
+      Serial.println("LED ON");
+      digitalWrite(10, HIGH);
+    } else if (value == "OFF") {
+      Serial.println("LED OFF");
+      digitalWrite(10, LOW);
+    }
+  }
+};
+
+class MyServerCallbacks : public NimBLEServerCallbacks {
+  void onConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo) {
+    Serial.println("Klient połączony");
+  }
+  void onDisconnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo, int reason) {
+    Serial.println("Klient rozłączony, wznawiam reklamowanie...");
+    NimBLEDevice::startAdvertising();
+  }
+};
+
+int readSoilPercent() {
+  int soilRaw = analogRead(SOIL_PIN);
+  int soilPercent = map(soilRaw, DRY_VALUE, WET_VALUE, 0, 100);
+  soilPercent = constrain(soilPercent, 0, 100);
+
+  Serial.println("===== SOIL SENSOR =====");
+  Serial.print("Odczyt ADC: ");
+  Serial.println(soilRaw);
+  Serial.print("Wilgotność gleby: ");
+  Serial.print(soilPercent);
+  Serial.println(" %");
+  Serial.println();
+
+  return soilPercent;
+}
+
+void startBLE() {
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+  Serial.println("Start BLE...");
+  NimBLEDevice::init("ESP32C3Zero");
+  NimBLEDevice::setSecurityAuth(false, false, false);
+  NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+  pServer = NimBLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
+
+  NimBLEService* pService = pServer->createService(SERVICE_UUID);
+
+  pCharacteristic = pService->createCharacteristic(
+    CHARACTERISTIC_UUID,
+    NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR | NIMBLE_PROPERTY::NOTIFY);
+
+
+  pCharacteristic->setCallbacks(new MyCallbacks());
+
+  pCharacteristic->setValue("Hello Romantyczna!");
+
+  pService->start();
+
+  NimBLEAdvertising* pAdvertising = NimBLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID(SERVICE_UUID);
+  pAdvertising->start();
+
+  Serial.println("Bluetooth device is ready to pair!");
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+  startBLE();
+  Wire.begin(I2C_SDA, I2C_SCL);
+
+  Serial.println(F("Inicjalizacja BMP280..."));
+  if (!bmp.begin(0x76)) {
+    Serial.println("Nie znaleziono czujnika BMP280!");
+    while (1)
+      ;
+  }
+
+  Serial.println(F("Inicjalizacja DHT11..."));
+  dht.begin();
+
+  Serial.print("Łączenie z WiFi: ");
+  Serial.println(ssid);
+  WiFi.begin(ssid, password);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println("\nPołączono z WiFi!");
+  Serial.print("Adres IP: ");
+  Serial.println(WiFi.localIP());
+
+  Serial.println("Timer ustawiony na 5 sekund (timerDelay).");
+}
+
+void loop() {
+  if ((millis() - lastTime) > timerDelay) {
+
+    if (WiFi.status() == WL_CONNECTED) {
+      WiFiClientSecure client;
+      client.setInsecure();
+      HTTPClient http;
+
+      String url = serverName + "/reading";
+      http.begin(client, url);
+      http.addHeader("Content-Type", "application/json");
+
+      float temp_bmp = bmp.readTemperature();
+      float pressure = bmp.readPressure() / 100.0F;
+
+      float temp_dht = dht.readTemperature();
+      float humidity = dht.readHumidity();
+
+      int soilPercent = readSoilPercent();
+
+      Serial.println("===== DHT11 =====");
+      if (isnan(temp_dht) || isnan(humidity)) {
+        Serial.println("Błąd odczytu z DHT11!");
+      } else {
+        Serial.print("Temperatura: ");
+        Serial.print(temp_dht);
+        Serial.println(" °C");
+        Serial.print("Wilgotność: ");
+        Serial.print(humidity);
+        Serial.println(" %");
+      }
+
+      Serial.println("===== BMP280 =====");
+      Serial.print("Temperatura: ");
+      Serial.print(temp_bmp);
+      Serial.println(" °C");
+      Serial.print("Ciśnienie: ");
+      Serial.print(pressure);
+      Serial.println(" hPa");
+      Serial.println();
+
+      String httpRequestData = "{";
+      bool first = true;
+
+      if (!isnan(temp_bmp)) {
+        if (!first) httpRequestData += ",";
+        httpRequestData += "\"temperature\":" + String(temp_bmp, 2);
+        first = false;
+      }
+
+      if (!isnan(humidity)) {
+        if (!first) httpRequestData += ",";
+        httpRequestData += "\"humidity\":" + String(humidity, 2);
+        first = false;
+      }
+
+      if (!isnan(pressure)) {
+        if (!first) httpRequestData += ",";
+        httpRequestData += "\"pressure\":" + String(pressure, 2);
+        first = false;
+      }
+
+      if (soilPercent >= 0 && soilPercent <= 100) {
+        if (!first) httpRequestData += ",";
+        httpRequestData += "\"soil\":" + String(soilPercent);
+        first = false;
+      }
+
+      if (!first) httpRequestData += ",";
+      httpRequestData += "\"timestamp\":\"" + String(millis()) + "\"";
+
+      httpRequestData += "}";
+
+
+      Serial.print("Wysyłam dane: ");
+      Serial.println(httpRequestData);
+      Serial.print("Na serwer: ");
+      Serial.println(url);
+
+      int httpResponseCode = http.POST(httpRequestData);
+      Serial.print("HTTP Response code: ");
+      Serial.println(httpResponseCode);
+      Serial.println(http.getString());
+
+      http.end();
+      String val = "Czas: " + String(millis() / 1000) + "s";
+      pCharacteristic->setValue(val.c_str());
+      pCharacteristic->notify();
+      Serial.println("Current Value: " + val);
+    } else {
+      Serial.println("WiFi rozłączone. Próba ponownego połączenia...");
+      WiFi.begin(ssid, password);
+    }
+
+    lastTime = millis();
+  }
+}
